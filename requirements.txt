@@ -1,0 +1,14 @@
+aiohttp
+beautifulsoup4
+google-generativeai
+milvus-lite
+pymilvus
+pymilvus-model
+pypdf
+python-dotenv
+requests
+tiktoken
+tomli
+torch
+streamlit
+atlassian-python-api
