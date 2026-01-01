@@ -1,6 +1,6 @@
 aiohttp
 beautifulsoup4
-google-generativeai
+google-genai
 milvus-lite
 pymilvus
 pymilvus-model

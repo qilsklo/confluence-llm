@@ -12,10 +12,8 @@ from pymilvus import MilvusClient, FieldSchema, CollectionSchema, DataType, mode
 import tiktoken
 from bs4 import NavigableString
 import io
-import pdfprocessor
-import os
 import glob
-import pypdf
+import os
 from collections import deque
 
 
@@ -23,11 +21,10 @@ import datetime
 
 
 # Collection Names
-COLLECTION_PDF = "myshake_pdf"
-COLLECTION_WEB = "myshake_web"
+COLLECTION_WEB = "calsol"
 processed_urls_collection = "processed_urls"
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "myshake.db")
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calsol.db")
 client = MilvusClient(DB_PATH)
 embedding_fn = model.DefaultEmbeddingFunction()  # sentence-transformers/all-MiniLM-L6-v2 - 256 token max
 max_tokens = 450
@@ -35,7 +32,6 @@ max_tokens = 450
 # --- Memory Safety Limits ---
 MAX_QUEUE_SIZE = 5000
 MAX_HTML_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB
-MAX_PDF_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
 MAX_CHUNKS_PER_PAGE = 200
 MAX_TEXT_PER_PAGE_CHARS = 100_000
 # ----------------------------
@@ -90,8 +86,6 @@ def scrape(start_urls):
             # Determine limit based on expected content type (naive check)
             # We'll refine this logic below, but strictly enforce a hard cap for safety.
             limit = MAX_HTML_SIZE_BYTES
-            if ".pdf" in url:
-                limit = MAX_PDF_SIZE_BYTES
             
             # Check Content-Length header if present
             content_length = response.headers.get('Content-Length')
@@ -126,10 +120,7 @@ def scrape(start_urls):
             mark_url_processed(url)
             continue
 
-        if ".pdf" in url:
-            process_scrape_pdf(response)
-            mark_url_processed(url)
-            continue
+
         if ".jpg" in url or ".png" in url or ".gif" in url or ".jpeg" in url:
             mark_url_processed(url)
             continue
@@ -242,73 +233,7 @@ def mark_url_processed(url):
         data=[{"url": url, "status": 1}]
     )
 
-def process_scrape_pdf(resp):
-    reader = pypdf.PdfReader(io.BytesIO(resp.content))
-    # Pass metadata if available, but for scraped PDFs we might only have URL
-    # We can try to get title from PDF metadata
-    title = ""
-    author = ""
-    try:
-        if reader.metadata:
-            title = reader.metadata.get('/Title', "")
-            author = reader.metadata.get('/Author', "")
-    except:
-        pass
-        
-    if not title:
-        title = os.path.basename(resp.url)
 
-    chunks = pdfprocessor.chunk_pdf(reader, resp.url, embedding_fn.tokenizer, max_tokens, title=title, author=author)
-    
-    # Enforce chunk and text limits on the result
-    if chunks:
-        if len(chunks) > MAX_CHUNKS_PER_PAGE:
-            print(f"Truncating PDF chunks for {resp.url}: {len(chunks)} -> {MAX_CHUNKS_PER_PAGE}")
-            chunks = chunks[:MAX_CHUNKS_PER_PAGE]
-            
-        db_store(chunks, COLLECTION_PDF)
-    print(f"Processed PDF; URL: {resp.url}.")
-
-def process_local_pdf(filepath):
-    try:
-        # Create a file URI for the origin
-        file_uri = f"file://{os.path.abspath(filepath)}"
-        
-        # Deduplication check
-        if is_url_processed(file_uri):
-            print(f"Skipping already processed local PDF: {filepath}")
-            return
-
-        reader = pypdf.PdfReader(filepath)
-        
-        title = ""
-        author = ""
-        try:
-            if reader.metadata:
-                title = reader.metadata.get('/Title', "")
-                author = reader.metadata.get('/Author', "")
-        except:
-            pass
-            
-        if not title:
-            title = os.path.basename(filepath)
-
-        chunks = pdfprocessor.chunk_pdf(reader, file_uri, embedding_fn.tokenizer, max_tokens, title=title, author=author)
-        if chunks:
-            # Enforce chunk limits for local PDFs too
-            if len(chunks) > MAX_CHUNKS_PER_PAGE:
-                print(f"Truncating local PDF chunks for {filepath}: {len(chunks)} -> {MAX_CHUNKS_PER_PAGE}")
-                chunks = chunks[:MAX_CHUNKS_PER_PAGE]
-
-            db_store(chunks, COLLECTION_PDF)
-            # Mark as processed only after successful store
-            mark_url_processed(file_uri)
-            print(f"Processed local PDF: {filepath}")
-        else:
-            print(f"No chunks extracted from {filepath}")
-            
-    except Exception as e:
-        print(f"Failed to process local PDF {filepath}: {e}")
 
 
 
@@ -644,41 +569,10 @@ def fetch_earthquake_feed(url):
 
 def init_collection():
     
-    # 1. PDF Collection
-    if not client.has_collection(collection_name=COLLECTION_PDF):
-        # Define BM25 Function
-        bm25_function = Function(
-            name="text_bm25_emb",
-            input_field_names=["text"],
-            output_field_names=["sparse"],
-            function_type=FunctionType.BM25,
-        )
+    # 1. PDF Collection - Removed
+    # if not client.has_collection(collection_name=COLLECTION_PDF):
+    #     ...
 
-        fields = [
-            FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
-            FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=768),
-            FieldSchema(name="sparse", dtype=DataType.SPARSE_FLOAT_VECTOR), # BM25 Output
-            FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=65535, enable_analyzer=True), # Enable analyzer for BM25
-            FieldSchema(name="title", dtype=DataType.VARCHAR, max_length=512),
-            FieldSchema(name="page_num", dtype=DataType.INT64),
-            FieldSchema(name="author", dtype=DataType.VARCHAR, max_length=512),
-            FieldSchema(name="doi", dtype=DataType.VARCHAR, max_length=256),
-            FieldSchema(name="publication_year", dtype=DataType.INT64),
-        ]
-
-        schema = CollectionSchema(fields, description="PDF Documents", functions=[bm25_function])
-        client.create_collection(
-            collection_name=COLLECTION_PDF,
-            schema=schema,
-        )
-
-        index_params = client.prepare_index_params()
-        index_params.add_index(field_name="vector", index_type="AUTOINDEX", metric_type="COSINE")
-        index_params.add_index(field_name="sparse", index_type="SPARSE_INVERTED_INDEX", metric_type="BM25")
-        client.create_index(collection_name=COLLECTION_PDF, index_params=index_params)
-        print(f"Collection '{COLLECTION_PDF}' created.")
-    else:
-        print(f"Collection '{COLLECTION_PDF}' already exists.")
 
     # 2. Web Collection
     if not client.has_collection(collection_name=COLLECTION_WEB):
@@ -742,11 +636,7 @@ if __name__ == '__main__':
 
     init_collection()
     
-    # #Process local PDFs first
-    # pdf_files = glob.glob("docs/*.pdf")
-    # print(f"Found {len(pdf_files)} local PDF files in docs/")
-    # for pdf_file in pdf_files:
-    #     process_local_pdf(pdf_file)
+
 
     u =["https://www.earthquakecountry.org/",
         "https://www.usgs.gov/programs/earthquake-hazards/faqs-category",
