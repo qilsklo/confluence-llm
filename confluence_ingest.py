@@ -298,3 +298,57 @@ if __name__ == "__main__":
         update_confluence()
     except KeyboardInterrupt:
         print("\nSync stopped.")
+
+
+def get_page_content_by_id(page_id):
+    """
+    Fetches the full storage format of a page by its ID.
+    Returns the raw HTML content string or None if failed.
+    """
+    if not confluence:
+        print("Confluence client not initialized.")
+        return None
+        
+    try:
+        page = confluence.get_page_by_id(page_id, expand='body.storage')
+        return page.get('body', {}).get('storage', {}).get('value', '')
+    except Exception as e:
+        print(f"Error fetching page {page_id}: {e}")
+        return None
+
+def get_page_content_by_url(url):
+    """
+    Fetches full page content using URL.
+    1. Looks up page_id from CONFLUENCE_PAGES_COLLECTION using the URL.
+    2. Calls get_page_content_by_id.
+    """
+    if not confluence:
+        return None
+        
+    # Check if we can extract ID from URL regex (fast path)
+    # CalSol URLs: .../pages/12345/Title
+    import re
+    match = re.search(r'/pages/(\d+)/', url)
+    if match:
+        page_id = match.group(1)
+        return get_page_content_by_id(page_id)
+
+    # Slow path: Query Metadata DB
+    # Note: standardscraper.client is available via import
+    from standardscraper import client, CONFLUENCE_PAGES_COLLECTION
+    
+    try:
+        res = client.query(
+            collection_name=CONFLUENCE_PAGES_COLLECTION,
+            filter=f'url == "{url}"',
+            output_fields=["page_id"]
+        )
+        if res and len(res) > 0:
+            page_id = res[0]['page_id']
+            return get_page_content_by_id(page_id)
+        else:
+            print(f"URL not found in metadata: {url}")
+            return None
+    except Exception as e:
+        print(f"Metadata lookup failed for {url}: {e}")
+        return None

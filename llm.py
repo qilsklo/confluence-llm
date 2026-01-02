@@ -12,15 +12,32 @@ from confluence_ingest import sync_confluence_space
 load_dotenv()
 
 # --- PROMPT DEFINITION ---
-CONFLUENCE_PROMPT = """You are a helpful assistant for the CalSol Solar Car Team.
-Your goal is to answer questions using the provided context from Confluence, but you may use internal knowledge to supplement low-quality context.
+# --- PROMPT DEFINITION ---
+# --- PROMPTS ---
+
+DECOMPOSITION_PROMPT = """You are a senior engineer breaking down a complex user question into specific research steps.
+User Query: "{user_query}"
+
+Goal: Identify the key pieces of information needed to answer this fully.
+Output: A Python list of strings, where each string is a specific search query. Limit to as many high-value queries as needed to produce a comprehensive result.
+
+Example:
+User: "What powers the car?"
+Output: ["electrical power distribution system", "battery pack specifications", "main power components list", "solar array power rating"]
+
+Output:
+"""
+
+ENGINEER_PROMPT = """You are the Chief Engineer of the CalSol Solar Car Team.
+Your goal is to explain the system to a new member based *strictly* on the provided documentation.
+You are teaching them how the car works.
 
 --- INSTRUCTIONS ---
-1. Use the provided Context to answer the user's question.
-2. If the answer is not in the context, state that you do not have enough information.
-3. internal knowledge can be used to explain concepts, but context is the primary source of truth.
-4. If you find a relevant page in the context, mention its title or provide its URL in your answer.
-Never directly tell the user about "provided context" explicitly. You may use the context in your answer, but the user is unaware that this context exists.
+1.  **Synthesize**: Combine information from multiple sources to build a complete picture.
+2.  **Inference**: You are allowed to infer system design from partial information, but you must label it. (e.g., "While not explicitly stated, the presence of X suggests Y...")
+3.  **Honesty**: If a critical piece of information is missing, explicitly state what is unknown.
+4.  **Citations**: Cite the title of the page you are referencing.
+5.  **Tone**: Professional, technical, educational, and authoritative.
 
 --- CONTEXT ---
 {context_text}
@@ -29,7 +46,7 @@ Never directly tell the user about "provided context" explicitly. You may use th
 {history_text}
 
 User: {user_query}
-Assistant:
+Chief Engineer:
 """
 
 def get_api_key():
@@ -69,38 +86,81 @@ def get_api_key():
     return key
 
 
-def search_knowledge_base(query, limit=10):
+def generate_search_plan(query, api_key):
     """
-    Performs hybrid search (BM25 + Vector) across the Web collection.
+    Decomposes the user query into sub-questions using a lightweight LLM call.
     """
+    client = genai.Client(api_key=api_key)
+    prompt = DECOMPOSITION_PROMPT.format(user_query=query)
+    
     try:
-        # 1. Prepare Requests
-        query_dense = standardscraper.embedding_fn.encode_queries([query])[0]
-        
-        # Dense Request (Vector)
-        req_dense = AnnSearchRequest(
-            data=[query_dense],
-            anns_field="vector",
-            param={"metric_type": "COSINE", "params": {}},
-            limit=limit * 2 
+        response = client.models.generate_content(
+            model='gemini-2.0-flash',
+            contents=prompt
         )
+        text = response.text.strip()
         
-        # Sparse Request (BM25)
-        req_sparse = AnnSearchRequest(
-            data=[query], # Text for BM25 function
-            anns_field="sparse",
-            param={"metric_type": "BM25", "params": {}},
-            limit=limit * 2
-        )
+        # Parse list from text (handle various formats)
+        import ast
+        import re
         
-        reqs = [req_dense, req_sparse]
-        ranker = RRFRanker(k=60)
+        # Try to find a list-like structure
+        match = re.search(r'\[.*\]', text, re.DOTALL)
+        if match:
+            list_str = match.group(0)
+            try:
+                plan = ast.literal_eval(list_str)
+                if isinstance(plan, list):
+                    return plan
+            except:
+                pass
+                
+        # Fallback: split by newlines if it looks like a list
+        lines = text.split('\n')
+        plan = [l.strip('- ').strip() for l in lines if l.strip()]
+        if plan:
+            return plan
+
+        return [query]
+    except Exception as e:
+        print(f"Decomposition failed: {e}")
+        return [query]
+
+def search_knowledge_base(queries, limit=5):
+    """
+    Performs hybrid search (BM25 + Vector) across the Web collection for MULTIPLE queries.
+    Aggregates results.
+    """
+    if isinstance(queries, str):
+        queries = [queries]
         
-        results = []
-        
-        # Search Web Collection (Confluence Pages)
+    all_results = {} # url -> doc_dict (deduplication by URL)
+    
+    for query in queries:
         try:
-            # Check if collection is empty to avoid Milvus crash
+            # 1. Prepare Requests
+            query_dense = standardscraper.embedding_fn.encode_queries([query])[0]
+            
+            # Dense Request (Vector)
+            req_dense = AnnSearchRequest(
+                data=[query_dense],
+                anns_field="vector",
+                param={"metric_type": "COSINE", "params": {}},
+                limit=limit * 2 
+            )
+            
+            # Sparse Request (BM25)
+            req_sparse = AnnSearchRequest(
+                data=[query], # Text for BM25 function
+                anns_field="sparse",
+                param={"metric_type": "BM25", "params": {}},
+                limit=limit * 2
+            )
+            
+            reqs = [req_dense, req_sparse]
+            ranker = RRFRanker(k=60)
+            
+            # Search Web Collection
             stats = standardscraper.client.get_collection_stats(standardscraper.COLLECTION_WEB)
             if stats['row_count'] > 0:
                 res_web = standardscraper.client.hybrid_search(
@@ -108,74 +168,89 @@ def search_knowledge_base(query, limit=10):
                     reqs=reqs,
                     ranker=ranker,
                     limit=limit,
-                    output_fields=["text", "url", "site_name", "heading", "crawl_date"]
+                    output_fields=["text", "url", "site_name", "heading", "id"] # Added 'id'
                 )
                 
                 if res_web and len(res_web) > 0:
-                    seen_signatures = set()
                     for hit in res_web[0]:
                         entity = hit['entity']
-                        content = entity.get('text', '')
                         url = entity.get('url', '#')
+                        heading = entity.get('heading', 'No Title')
                         
-                        # Deduplicate based on URL and Content
-                        if (url, content) in seen_signatures:
-                            continue
-                        seen_signatures.add((url, content))
+                        if url not in all_results:
+                            all_results[url] = {
+                                "heading": heading,
+                                "url": url,
+                                "content": entity.get('text', ''),
+                                "id": entity.get('id', None),
+                                "score": hit['distance']
+                            }
+                        else:
+                            # Keep highest score? Or just append content if different?
+                            # For now, simplistic dedup.
+                            pass
 
-                        results.append({
-                            "type": "WEB",
-                            "content": content,
-                            "site_name": entity.get('site_name', 'Confluence'),
-                            "heading": entity.get('heading', ''),
-                            "url": url,
-                            "date": entity.get('crawl_date', ''),
-                            "score": hit['distance']
-                        })
-                        
         except Exception as e:
-            print(f"Hybrid Search failed: {e}")
-            
-        return results
+            print(f"Search failed for '{query}': {e}")
 
-    except Exception as e:
-        print(f"Search failed: {e}")
-        return []
+    return list(all_results.values())
 
 def query_rag(user_query, history, api_key, verbose=False):
-    # Initialize Client with the new SDK syntax
     client = genai.Client(api_key=api_key)
     
-    # 1. Retrieve Context
-    raw_docs = search_knowledge_base(user_query, limit=10)
+    # 1. Decomposition
+    if verbose: print("Thinking about research plan...")
+    plan = generate_search_plan(user_query, api_key)
+    if verbose: print(f"Research Plan: {plan}")
     
-    # 2. Format Context
-    formatted_docs = []
-    for i, doc in enumerate(raw_docs):
-        citation = f"(Source: {doc['heading']} | {doc['url']})"
-        formatted_docs.append(f"[DOC {i+1}] {citation}\n{doc['content']}")
+    # 2. Deep Retrieval
+    raw_docs = search_knowledge_base(plan, limit=3)
     
-    context_text = "\n\n".join(formatted_docs)
+    # 3. Context Expansion (Fetch Full Content)
+    # This simulates "Senior Engineer" reading the whole doc
+    expanded_context = []
+    
+    # Lazy import to avoid circular dependency issues at top level if any
+    from confluence_ingest import get_page_content_by_url
+    from bs4 import BeautifulSoup
+    
+    for doc in raw_docs:
+        # Check if we can/should fetch full content
+        # For now, let's fetch full content for ALL top hits to ensure comprehensive synthesis
+        full_content = None
+        if doc.get('url'):
+            if verbose: print(f"Reading full page: {doc['heading']}")
+            raw_html = get_page_content_by_url(doc['url'])
+            if raw_html:
+                # Basic text extraction
+                soup = BeautifulSoup(raw_html, 'html.parser')
+                full_content = soup.get_text(separator='\n')
+        
+        content_to_use = full_content if full_content else doc['content']
+        
+        citation = f"SOURCE: {doc['heading']} ({doc['url']})"
+        expanded_context.append(f"{citation}\n---\n{content_to_use}\n---")
+    
+    context_text = "\n\n".join(expanded_context)
     
     if not context_text:
         context_text = "No relevant documents found in the database."
 
     if verbose:
-        print(f"\n[DEBUG] Context passed to LLM:\n{context_text}\n[DEBUG] End Context")
+        print(f"\n[DEBUG] Context Length: {len(context_text)} chars")
 
-    # 3. Format History
+    # 4. Format History
     history_text = ""
     for role, msg in history:
         history_text += f"{role}: {msg}\n"
     
-    # 4. Construct Prompt
-    prompt = CONFLUENCE_PROMPT.format(
+    # 5. Synthesis
+    prompt = ENGINEER_PROMPT.format(
         context_text=context_text, 
         history_text=history_text, 
         user_query=user_query
     )
 
-    # 5. Generate Response
     try:
         response = client.models.generate_content(
             model='gemini-2.0-flash',
@@ -186,7 +261,7 @@ def query_rag(user_query, history, api_key, verbose=False):
         return f"Error calling LLM: {e}"
 
 def main_streamlit():
-    st.set_page_config(page_title="Confluence Assistant", page_icon="�️")
+    st.set_page_config(page_title="Confluence Assistant", page_icon="☀️")
     st.title("☀️ CalSol Confluence Assistant")
 
     api_key = get_api_key()
@@ -209,8 +284,8 @@ def main_streamlit():
 
         # Display assistant response in chat message container
         with st.chat_message("assistant"):
-            with st.spinner("Searching knowledge base..."):
-                # Convert Streamlit history to the format expected by query_rag
+            with st.spinner("Thinking & Searching..."):
+                 # Convert Streamlit history to the format expected by query_rag
                 history_tuples = [(msg["role"].capitalize(), msg["content"]) for msg in st.session_state.messages[:-1]]
                 
                 response = query_rag(prompt, history_tuples, api_key)
