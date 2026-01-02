@@ -19,7 +19,7 @@ DECOMPOSITION_PROMPT = """You are a senior engineer breaking down a complex user
 User Query: "{user_query}"
 
 Goal: Identify the key pieces of information needed to answer this fully.
-Output: A Python list of strings, where each string is a specific search query. Limit to as many high-value queries as needed to produce a comprehensive result.
+Output: A Python list of strings, where each string is a specific search query. Limit to 3-5 high-value queries.
 
 Example:
 User: "What powers the car?"
@@ -204,7 +204,7 @@ def query_rag(user_query, history, api_key, verbose=False):
     if verbose: print(f"Research Plan: {plan}")
     
     # 2. Deep Retrieval
-    raw_docs = search_knowledge_base(plan, limit=3)
+    raw_docs = search_knowledge_base(plan, limit=5)
     
     # 3. Context Expansion (Fetch Full Content)
     # This simulates "Senior Engineer" reading the whole doc
