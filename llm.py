@@ -344,6 +344,15 @@ def main_streamlit():
                     # Reset state after completion or failure so it doesn't auto-run on reload
                     st.session_state.run_sync = False
         st.link_button("Submit a bug report", "https://forms.gle/TETjF28UvvzLsTVNA")
+        
+        st.markdown(
+            """
+            <div style='text-align: center; color: #888888; margin-top: 50px; font-size: 0.8em;'>
+                By Soham Kulkarni (<a href='mailto:sohamkulkarni@berkeley.edu' style='color: #888888; text-decoration: none;'>sohamkulkarni@berkeley.edu</a>)
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
 
 def main_cli():
     api_key = get_api_key()
