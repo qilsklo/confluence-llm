@@ -343,6 +343,7 @@ def main_streamlit():
                 finally:
                     # Reset state after completion or failure so it doesn't auto-run on reload
                     st.session_state.run_sync = False
+        st.link_button("Submit a bug report", "https://forms.gle/TETjF28UvvzLsTVNA")
 
 def main_cli():
     api_key = get_api_key()
