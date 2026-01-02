@@ -6,19 +6,21 @@ import google.genai as genai
 import streamlit as st
 import standardscraper
 from pymilvus import AnnSearchRequest, RRFRanker
+from confluence_ingest import sync_confluence_space
 
 # Load environment variables
 load_dotenv()
 
 # --- PROMPT DEFINITION ---
 CONFLUENCE_PROMPT = """You are a helpful assistant for the CalSol Solar Car Team.
-Your goal is to answer questions using ONLY the provided context from Confluence.
+Your goal is to answer questions using the provided context from Confluence, but you may use internal knowledge to supplement low-quality context.
 
 --- INSTRUCTIONS ---
 1. Use the provided Context to answer the user's question.
 2. If the answer is not in the context, state that you do not have enough information.
 3. internal knowledge can be used to explain concepts, but context is the primary source of truth.
 4. If you find a relevant page in the context, mention its title or provide its URL in your answer.
+Never directly tell the user about "provided context" explicitly. You may use the context in your answer, but the user is unaware that this context exists.
 
 --- CONTEXT ---
 {context_text}
@@ -110,14 +112,23 @@ def search_knowledge_base(query, limit=10):
                 )
                 
                 if res_web and len(res_web) > 0:
+                    seen_signatures = set()
                     for hit in res_web[0]:
                         entity = hit['entity']
+                        content = entity.get('text', '')
+                        url = entity.get('url', '#')
+                        
+                        # Deduplicate based on URL and Content
+                        if (url, content) in seen_signatures:
+                            continue
+                        seen_signatures.add((url, content))
+
                         results.append({
                             "type": "WEB",
-                            "content": entity.get('text', ''),
+                            "content": content,
                             "site_name": entity.get('site_name', 'Confluence'),
                             "heading": entity.get('heading', ''),
-                            "url": entity.get('url', '#'),
+                            "url": url,
                             "date": entity.get('crawl_date', ''),
                             "score": hit['distance']
                         })
@@ -131,7 +142,7 @@ def search_knowledge_base(query, limit=10):
         print(f"Search failed: {e}")
         return []
 
-def query_rag(user_query, history, api_key):
+def query_rag(user_query, history, api_key, verbose=False):
     # Initialize Client with the new SDK syntax
     client = genai.Client(api_key=api_key)
     
@@ -148,6 +159,9 @@ def query_rag(user_query, history, api_key):
     
     if not context_text:
         context_text = "No relevant documents found in the database."
+
+    if verbose:
+        print(f"\n[DEBUG] Context passed to LLM:\n{context_text}\n[DEBUG] End Context")
 
     # 3. Format History
     history_text = ""
@@ -205,6 +219,39 @@ def main_streamlit():
         # Add assistant response to chat history
         st.session_state.messages.append({"role": "assistant", "content": response})
 
+    # Sidebar Admin Section
+    with st.sidebar:
+        st.divider()
+        st.header("Admin Controls")
+        
+        # Space Key Input (optional, could be fixed)
+        space_key = st.text_input("Which space should we sync?", value="CG")
+        
+        if st.button("Update From Confluence"):
+            if not space_key:
+                st.error("Please provide a Space Key.")
+            else:
+                st.info(f"Starting sync for space: {space_key}...")
+                log_container = st.empty()
+                logs = []
+                
+                def streamlit_logger(msg):
+                    # Append new log line
+                    logs.append(msg)
+                    # Update container with all logs (simulating scroll)
+                    # Keeping last 10 lines for cleanliness or scrollable container
+                    log_text = "\n".join(logs[-10:]) 
+                    log_container.code(log_text, language='text')
+                    # Also print to console for debugging
+                    print(msg)
+                
+                try:
+                    with st.spinner("Syncing... This may take a while."):
+                        sync_confluence_space(space_key, status_func=streamlit_logger, incremental=True)
+                    st.success("Sync Completed!")
+                except Exception as e:
+                    st.error(f"Sync failed: {e}")
+
 def main_cli():
     api_key = get_api_key()
     history = [] 
@@ -215,7 +262,7 @@ def main_cli():
         if query.lower() in ['quit', 'exit']:
             break
         
-        answer = query_rag(query, history, api_key)
+        answer = query_rag(query, history, api_key, verbose=True)
         print("\nResponse:")
         print(answer)
         

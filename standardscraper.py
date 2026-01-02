@@ -23,6 +23,7 @@ import datetime
 # Collection Names
 COLLECTION_WEB = "calsol"
 processed_urls_collection = "processed_urls"
+CONFLUENCE_PAGES_COLLECTION = "confluence_pages"
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calsol.db")
 client = MilvusClient(DB_PATH)
@@ -307,8 +308,11 @@ def chunk_soup(soup, url):
         
         final_content = " ".join(curr)
         final_chunk = f"{context_str}\n{final_content}" if context_str else final_content
-        if final_content and count_tokens(final_chunk) >= MIN_TOKENS:
-            chunks.append(final_chunk)
+        
+        # Validate content has substance (independent of context)
+        # 3 tokens covers "Peter Choi" (2-3) but filters " | " (1)
+        if final_content and len(final_content.strip()) > 3: 
+             chunks.append(final_chunk)
             
         return chunks
 
@@ -372,6 +376,9 @@ def chunk_soup(soup, url):
         
         full_text = f"{context_str}\n{text}" if context_str else text
         
+        if count_tokens(full_text) < MIN_TOKENS:
+            return
+
         if count_tokens(full_text) > max_tokens:
             out = split_paragraph(text, context_str)
         else:
@@ -631,7 +638,77 @@ def init_collection():
     else:
         print(f"Collection '{processed_urls_collection}' already exists.")
 
+    # 4. Confluence Pages Collection
+    if not client.has_collection(collection_name=CONFLUENCE_PAGES_COLLECTION):
+        conf_fields = [
+            FieldSchema(name="page_id", dtype=DataType.VARCHAR, max_length=128, is_primary=True),
+            FieldSchema(name="version", dtype=DataType.INT64),
+            FieldSchema(name="url", dtype=DataType.VARCHAR, max_length=2048),
+            FieldSchema(name="last_seen", dtype=DataType.VARCHAR, max_length=64),
+            FieldSchema(name="space_key", dtype=DataType.VARCHAR, max_length=64),
+        ]
+        conf_schema = CollectionSchema(conf_fields, description="Track Confluence page versions")
+        client.create_collection(
+            collection_name=CONFLUENCE_PAGES_COLLECTION,
+            schema=conf_schema
+        )
+        print(f"Collection '{CONFLUENCE_PAGES_COLLECTION}' created.")
+    else:
+        print(f"Collection '{CONFLUENCE_PAGES_COLLECTION}' already exists.")
+
+
+def get_confluence_metadata(page_ids):
+    """
+    Retrieve version metadata for a list of page_ids.
+    Returns a dict: {page_id: {'version': v, 'last_seen': t, ...}}
+    """
+    # Milvus 2.4+ supports `id in [...]`
+    # For older versions, we might need multiple queries or specific filter
+    # Assuming standard filter support
+    
+    if not page_ids:
+        return {}
+
+    # Quote IDs for filter string
+    ids_str = ",".join([f'"{pid}"' for pid in page_ids])
+    
+    res = client.query(
+        collection_name=CONFLUENCE_PAGES_COLLECTION,
+        filter=f'page_id in [{ids_str}]',
+        output_fields=["page_id", "version", "last_seen", "url"]
+    )
+    
+    return {r["page_id"]: r for r in res}
+
+def update_confluence_metadata(page_data_list):
+    """
+    Upsert metadata for processed pages.
+    page_data_list = [{page_id, version, url, last_seen, space_key}, ...]
+    """
+    if not page_data_list:
+        return
+        
+    client.upsert(
+        collection_name=CONFLUENCE_PAGES_COLLECTION,
+        data=page_data_list
+    )
+
+
+
+def delete_page_chunks(url):
+    """
+    Delete all chunks associated with a specific URL.
+    Used before re-ingesting a page to prevent duplicates.
+    """
+    try:
+        # Milvus 2.3+ supports delete by filter
+        res = client.delete(
+            collection_name=COLLECTION_WEB,
+            filter=f'url == "{url}"'
+        )
+        # print(f"Deleted chunks for {url}: {res}") # Squelch noisy log
+    except Exception as e:
+        print(f"Error deleting chunks for {url}: {e}")
 
 if __name__ == '__main__':
-
     print("please run confluence_ingest.py")
