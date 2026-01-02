@@ -7,6 +7,7 @@ import streamlit as st
 import standardscraper
 from pymilvus import AnnSearchRequest, RRFRanker
 from confluence_ingest import sync_confluence_space
+import confluence_ingest
 
 # Load environment variables
 load_dotenv()
@@ -299,10 +300,23 @@ def main_streamlit():
         st.divider()
         st.header("Admin Controls")
         
+
         # Space Key Input (optional, could be fixed)
-        space_key = st.text_input("Which space should we sync?", value="CG")
+        space_key = st.selectbox("Which space should we sync?", ["CG"])
         
-        if st.button("Update From Confluence"):
+        col1, col2 = st.columns(2)
+        with col1:
+             if st.button("Start Sync"):
+                 confluence_ingest.clear_stop_flag()
+                 st.session_state.run_sync = True
+        
+        with col2:
+             if st.button("Stop Sync"):
+                 confluence_ingest.set_stop_flag(True)
+                 st.session_state.run_sync = False
+                 st.warning("Stopping sync...")
+
+        if st.session_state.get("run_sync"):
             if not space_key:
                 st.error("Please provide a Space Key.")
             else:
@@ -322,10 +336,13 @@ def main_streamlit():
                 
                 try:
                     with st.spinner("Syncing... This may take a while."):
-                        sync_confluence_space(space_key, status_func=streamlit_logger, incremental=True)
+                        sync_confluence_space(space_key, status_func=streamlit_logger)
                     st.success("Sync Completed!")
                 except Exception as e:
                     st.error(f"Sync failed: {e}")
+                finally:
+                    # Reset state after completion or failure so it doesn't auto-run on reload
+                    st.session_state.run_sync = False
 
 def main_cli():
     api_key = get_api_key()

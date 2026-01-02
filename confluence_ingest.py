@@ -35,68 +35,53 @@ else:
 
 import json
 
-STATE_FILE = "confluence_sync_state.json"
 
-def load_sync_state():
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, 'r') as f:
-                return json.load(f)
-        except:
-            return {}
-    return {}
+STOP_FILE = "confluence_sync_stop.json"
 
-def save_sync_state(state):
+def set_stop_flag(value: bool):
     try:
-        with open(STATE_FILE, 'w') as f:
-            json.dump(state, f)
+        with open(STOP_FILE, "w") as f:
+            json.dump({"stop": value}, f)
     except Exception as e:
-        print(f"Failed to save sync state: {e}")
+        print(f"Failed to set stop flag: {e}")
 
-def sync_confluence_space(space_key, status_func=print, incremental=True):
+def should_stop():
+    if not os.path.exists(STOP_FILE):
+        return False
+    try:
+        with open(STOP_FILE, "r") as f:
+            data = json.load(f)
+            return data.get("stop", False)
+    except:
+        return False
+
+def clear_stop_flag():
+    set_stop_flag(False)
+
+def sync_confluence_space(space_key, status_func=print):
     """
     Syncs pages from a specific Confluence space using CQL.
-    Uses 'lastModified' timestamp to perform incremental updates.
+    Scans from Newest to Oldest, updating new/changed pages and skipping known ones.
+    Supports cooperative cancellation via stop flag.
     """
     if not confluence:
         status_func("Confluence client not initialized.")
         return
 
-    status_func(f"Starting Sync for Space: {space_key}")
+    # Check initially
+    if should_stop():
+        status_func("Stopped gracefully.")
+        return
+
+    status_func(f"Scanning space {space_key} for new or updated pages...")
     
-    # 1. Determine Sync Start Time
-    # If incremental is False, we ignore state to force full sync.
-    last_sync = None
-    if incremental:
-        state = load_sync_state()
-        last_sync = state.get(space_key)
-    else:
-        status_func("Mode: Full Sync (Forced)")
-    
-    # Capture current time (UTC) for the next sync state
-    # Using a slight buffer (e.g., -1 minute) might be safer for clock skew, but precise is okay.
-    # Confluence API usually expects "yyyy-mm-dd" or full timestamps.
-    # Let's use the format Confluence CQL expects: "yyyy/MM/dd HH:mm" or similar?
-    # Actually, CQL supports "2019-02-04 14:00" format.
-    
+    # Capture current time (UTC) for logging or future use
     now_ts = datetime.datetime.now(datetime.timezone.utc)
     
+    # CQL: All pages in space
     cql = f'space = "{space_key}" AND type = "page"'
     
-    if last_sync:
-        status_func(f"Incremental Sync: Looking for changes since {last_sync}")
-        # Make sure last_sync is in a format CQL likes. 
-        # State stores ISO format, CQL likes "2006/01/02 15:04" or "2006-01-02 15:04"
-        # We'll just trust the passed format or clean it.
-        # Simplest is: lastModified > "2024-01-01 12:00"
-        
-        # Ensure 'T' is replaced by space if needed, though some APIs accept T.
-        safe_date = last_sync.replace("T", " ")[:16] # "YYYY-MM-DD HH:MM"
-        cql += f' AND lastModified > "{safe_date}"'
-    else:
-        status_func("Full Sync: Fetching all pages.")
-    
-    # Add ordering
+    # Add ordering: Newest first
     cql += ' ORDER BY lastModified DESC'
     
     start = 0
@@ -104,12 +89,13 @@ def sync_confluence_space(space_key, status_func=print, incremental=True):
     total_processed = 0
     
     while True:
+        # Check cancellation before batch
+        if should_stop():
+            status_func("Stopped gracefully.")
+            return
+
         try:
             # Execute CQL Search
-            # expand='version' to check vs local, 'body.storage' to ingest
-            # Since CQL implies we ONLY got changed pages (if incremental),
-            # we can assume we need to process them.
-            # However, for robustness, we still fetch them.
             results = confluence.cql(
                 cql, 
                 start=start, 
@@ -124,20 +110,13 @@ def sync_confluence_space(space_key, status_func=print, incremental=True):
             status_func(f"Processing batch of {len(pages)} pages (Start: {start})...")
             
             # Optimization: Pre-fetch metadata for this batch to check versions
-            # Collect IDs safely
             batch_pids = []
-            
-            # Normalize pages list to be a list of the actual page dictionaries
-            # CQL results often wrap the page in "content" or just return search fields.
-            # Based on logs: keys are ['content', 'title', ...]. So the real page data might be in 'content'.
             
             normalized_pages = []
             for p in pages:
                 if 'content' in p and isinstance(p['content'], dict):
-                    # It's a search result wrapping the content
                     normalized_pages.append(p['content'])
                 else:
-                    # It's potentially already the page object (or we hope so)
                     normalized_pages.append(p)
             
             for p in normalized_pages:
@@ -149,11 +128,14 @@ def sync_confluence_space(space_key, status_func=print, incremental=True):
             changes_processed_in_batch = 0
             
             for page in normalized_pages:
+                # Check cancellation inside batch loop for faster response
+                if should_stop():
+                    status_func("Stopped gracefully.")
+                    return
+
                 # 1. Safe ID Access
                 pid = page.get('id')
                 if not pid:
-                     # This might happen if normalized_page is still not quite right, but let's log it.
-                     # status_func(f"Skipping malformed (no id): keys={list(page.keys())}")
                      continue
                      
                 try:
@@ -177,6 +159,7 @@ def sync_confluence_space(space_key, status_func=print, incremental=True):
                             "last_seen": now_ts.isoformat(),
                             "space_key": space_key
                         }])
+                        status_func(f"Synced: {ingest_result['url']}")
                         changes_processed_in_batch += 1
                         
                 except Exception as e:
@@ -192,18 +175,6 @@ def sync_confluence_space(space_key, status_func=print, incremental=True):
         except Exception as e:
             status_func(f"Error executing CQL at start={start}: {e}")
             break
-            
-    # Update State on success
-    # We store the timestamp we started with.
-    # Note: If pages were modified DURING the sync, we might miss them next time 
-    # if we set time to NOW. But typically acceptable risk.
-    if incremental:
-        state = load_sync_state() # reload to be safe
-    else:
-        state = load_sync_state() # load existing or new
-        
-    state[space_key] = now_ts.strftime("%Y-%m-%d %H:%M")
-    save_sync_state(state)
 
     status_func(f"Completed Sync for {space_key}. Processed: {total_processed}")
 
@@ -290,8 +261,8 @@ def update_confluence():
     
     # Assuming "CG" for now as per previous default
     target_space = "CG"
-    # CLI Mode: Force incremental=False
-    sync_confluence_space(target_space, incremental=False)
+    # CLI Mode: Force sync (now standard)
+    sync_confluence_space(target_space)
 
 if __name__ == "__main__":
     try:
