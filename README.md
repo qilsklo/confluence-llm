@@ -1,4 +1,4 @@
-# 3-step agentic search
+# 2-step agentic search
 To learn how this works, see `llm.py`
 
 ## To run this
