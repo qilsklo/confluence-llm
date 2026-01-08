@@ -265,6 +265,18 @@ def main_streamlit():
     st.set_page_config(page_title="Confluence Assistant", page_icon="☀️")
     st.title("☀️ CalSol Confluence Assistant")
 
+    # --- AUTHENTICATION ---
+    if not st.user.is_logged_in:
+        st.info("Please log in to access the assistant.", icon="🔒")
+        if st.button("Log in with Authentik"):
+            st.login()
+        st.stop()
+    
+    st.sidebar.markdown(f"Logged in as **{st.user.name}** ({st.user.email})")
+    if st.sidebar.button("Log out"):
+        st.logout()
+    # ----------------------
+
     api_key = get_api_key()
 
     # Initialize chat history
