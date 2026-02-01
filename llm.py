@@ -266,15 +266,92 @@ def main_streamlit():
     st.title("☀️ CalSol Confluence Assistant")
 
     # --- AUTHENTICATION ---
-    if not st.user.is_logged_in:
-        st.info("Please log in to access the assistant.", icon="🔒")
-        if st.button("Log in with Authentik"):
-            st.login()
+    from google_auth_oauthlib.flow import Flow
+    import requests
+
+    def check_auth():
+        # Check if user is already authenticated
+        if "google_auth_token" in st.session_state:
+            return True
+
+        # Check for OAuth callback
+        if "code" in st.query_params:
+            try:
+                code = st.query_params["code"]
+                
+                # Create flow instance to exchange code for token
+                flow = Flow.from_client_config(
+                    {
+                        "web": {
+                            "client_id": st.secrets["google"]["client_id"],
+                            "client_secret": st.secrets["google"]["client_secret"],
+                            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                            "token_uri": "https://oauth2.googleapis.com/token",
+                        }
+                    },
+                    scopes=["https://www.googleapis.com/auth/userinfo.email", "openid"],
+                    redirect_uri=st.secrets["google"]["redirect_uri"],
+                )
+                
+                flow.fetch_token(code=code)
+                credentials = flow.credentials
+                
+                # Get User Info
+                user_info = requests.get(
+                    "https://www.googleapis.com/oauth2/v2/userinfo",
+                    headers={"Authorization": f"Bearer {credentials.token}"}
+                ).json()
+                
+                email = user_info.get("email", "")
+                
+                # Check Domain
+                if not email.endswith("@berkeley.edu"):
+                    st.error("Access restricted to @berkeley.edu emails only.", icon="🚫")
+                    st.stop()
+                
+                # Save to session state
+                st.session_state["google_auth_token"] = credentials.token
+                st.session_state["user_email"] = email
+                st.session_state["user_name"] = user_info.get("name", "User")
+                
+                # Clear query params to prevent re-submission and clean URL
+                st.query_params.clear()
+                st.rerun()
+
+            except Exception as e:
+                st.error(f"Authentication failed: {e}")
+                st.stop()
+
+        return False
+
+    if not check_auth():
+        st.info("Please log in with your Berkeley Google account to access the assistant.", icon="🔒")
+        
+        # Create Flow for Login Button
+        flow = Flow.from_client_config(
+            {
+                "web": {
+                    "client_id": st.secrets["google"]["client_id"],
+                    "client_secret": st.secrets["google"]["client_secret"],
+                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                }
+            },
+            scopes=["https://www.googleapis.com/auth/userinfo.email", "openid"],
+            redirect_uri=st.secrets["google"]["redirect_uri"],
+        )
+        
+        auth_url, _ = flow.authorization_url(prompt='consent')
+        
+        st.link_button("Log in with Google", auth_url)
         st.stop()
     
-    st.sidebar.markdown(f"Logged in as **{st.user.name}** ({st.user.email})")
+    st.sidebar.markdown(f"Logged in as **{st.session_state.get('user_name')}** ({st.session_state.get('user_email')})")
     if st.sidebar.button("Log out"):
-        st.logout()
+        for key in ["google_auth_token", "user_email", "user_name"]:
+            if key in st.session_state:
+                del st.session_state[key]
+        st.rerun()
     # ----------------------
 
     api_key = get_api_key()
