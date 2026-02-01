@@ -13,4 +13,5 @@ torch
 streamlit
 atlassian-python-api
 transformers==4.46.3
-google-auth-oauthlibsetuptools==75.0.0
+google-oauth2-tool
+setuptools==75.0.0
