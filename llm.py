@@ -466,10 +466,7 @@ def main_cli():
             history = history[-10:]
 
 if __name__ == "__main__":
-    try:
-        if st.runtime.exists():
-            main_streamlit()
-        else:
-            main_cli()
-    except Exception:
+    if st.runtime.exists():
+        main_streamlit()
+    else:
         main_cli()
