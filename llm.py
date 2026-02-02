@@ -99,7 +99,7 @@ def generate_search_plan(query, api_key):
     
     try:
         response = client.models.generate_content(
-            model='gemini-2.0-flash',
+            model='gemini-2.5-flash',
             contents=prompt
         )
         text = response.text.strip()
@@ -257,7 +257,7 @@ def query_rag(user_query, history, api_key, verbose=False):
 
     try:
         response = client.models.generate_content(
-            model='gemini-2.0-flash',
+            model='gemini-2.5-flash',
             contents=prompt
         )
         return response.text
